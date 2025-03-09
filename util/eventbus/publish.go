@@ -5,14 +5,7 @@ package eventbus
 
 import (
 	"reflect"
-	"time"
 )
-
-type publishedEvent struct {
-	Event     any
-	From      *Client
-	Published time.Time
-}
 
 // publisher is a uniformly typed wrapper around Publisher[T], so that
 // debugging facilities can look at active publishers.
@@ -59,10 +52,9 @@ func (p *Publisher[T]) Publish(v T) {
 	default:
 	}
 
-	evt := publishedEvent{
-		Event:     v,
-		From:      p.client,
-		Published: time.Now(),
+	evt := PublishedEvent{
+		Event: v,
+		From:  p.client,
 	}
 
 	select {

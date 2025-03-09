@@ -8,14 +8,12 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
-	"time"
 )
 
-type queuedEvent struct {
-	Event     any
-	From      *Client
-	Published time.Time
-	Routed    time.Time
+type DeliveredEvent struct {
+	Event any
+	From  *Client
+	To    *Client
 }
 
 // subscriber is a uniformly typed wrapper around Subscriber[T], so
@@ -35,7 +33,7 @@ type subscriber interface {
 	// processing other potential sources of wakeups, which is how we end
 	// up at this awkward type signature and sharing of internal state
 	// through dispatch.
-	dispatch(ctx context.Context, vals *queue[queuedEvent], acceptCh func() chan queuedEvent) bool
+	dispatch(ctx context.Context, vals *queue[DeliveredEvent], acceptCh func() chan DeliveredEvent, snapshot chan chan []DeliveredEvent) bool
 	Close()
 }
 
@@ -44,8 +42,9 @@ type subscribeState struct {
 	client *Client
 
 	dispatcher *worker
-	write      chan queuedEvent
-	snapshot   chan chan []queuedEvent
+	write      chan DeliveredEvent
+	snapshot   chan chan []DeliveredEvent
+	debug      hook[DeliveredEvent]
 
 	outputsMu sync.Mutex
 	outputs   map[reflect.Type]subscriber
@@ -54,8 +53,8 @@ type subscribeState struct {
 func newSubscribeState(c *Client) *subscribeState {
 	ret := &subscribeState{
 		client:   c,
-		write:    make(chan queuedEvent),
-		snapshot: make(chan chan []queuedEvent),
+		write:    make(chan DeliveredEvent),
+		snapshot: make(chan chan []DeliveredEvent),
 		outputs:  map[reflect.Type]subscriber{},
 	}
 	ret.dispatcher = runWorker(ret.pump)
@@ -63,8 +62,8 @@ func newSubscribeState(c *Client) *subscribeState {
 }
 
 func (q *subscribeState) pump(ctx context.Context) {
-	var vals queue[queuedEvent]
-	acceptCh := func() chan queuedEvent {
+	var vals queue[DeliveredEvent]
+	acceptCh := func() chan DeliveredEvent {
 		if vals.Full() {
 			return nil
 		}
@@ -79,8 +78,16 @@ func (q *subscribeState) pump(ctx context.Context) {
 				vals.Drop()
 				continue
 			}
-			if !sub.dispatch(ctx, &vals, acceptCh) {
+			if !sub.dispatch(ctx, &vals, acceptCh, q.snapshot) {
 				return
+			}
+
+			if q.debug.active() {
+				q.debug.run(DeliveredEvent{
+					Event: val.Event,
+					From:  val.From,
+					To:    q.client,
+				})
 			}
 		} else {
 			// Keep the cases in this select in sync with
@@ -97,6 +104,34 @@ func (q *subscribeState) pump(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (s *subscribeState) snapshotQueue() []DeliveredEvent {
+	if s == nil {
+		return nil
+	}
+
+	resp := make(chan []DeliveredEvent)
+	select {
+	case s.snapshot <- resp:
+		return <-resp
+	case <-s.dispatcher.Done():
+		return nil
+	}
+}
+
+func (s *subscribeState) subscribeTypes() []reflect.Type {
+	if s == nil {
+		return nil
+	}
+
+	s.outputsMu.Lock()
+	defer s.outputsMu.Unlock()
+	ret := make([]reflect.Type, 0, len(s.outputs))
+	for t := range s.outputs {
+		ret = append(ret, t)
+	}
+	return ret
 }
 
 func (s *subscribeState) addSubscriber(t reflect.Type, sub subscriber) {
@@ -142,20 +177,28 @@ func (s *subscribeState) closed() <-chan struct{} {
 
 // A Subscriber delivers one type of event from a [Client].
 type Subscriber[T any] struct {
-	stop stopFlag
-	recv *subscribeState
-	read chan T
+	stop       stopFlag
+	read       chan T
+	unregister func()
 }
 
 func newSubscriber[T any](r *subscribeState) *Subscriber[T] {
 	t := reflect.TypeFor[T]()
 
 	ret := &Subscriber[T]{
-		recv: r,
-		read: make(chan T),
+		read:       make(chan T),
+		unregister: func() { r.deleteSubscriber(t) },
 	}
 	r.addSubscriber(t, ret)
 
+	return ret
+}
+
+func newMonitor[T any](attach func(fn func(T)) (cancel func())) *Subscriber[T] {
+	ret := &Subscriber[T]{
+		read: make(chan T, 100), // arbitrary, large
+	}
+	ret.unregister = attach(ret.monitor)
 	return ret
 }
 
@@ -163,7 +206,14 @@ func (s *Subscriber[T]) subscribeType() reflect.Type {
 	return reflect.TypeFor[T]()
 }
 
-func (s *Subscriber[T]) dispatch(ctx context.Context, vals *queue[queuedEvent], acceptCh func() chan queuedEvent) bool {
+func (s *Subscriber[T]) monitor(debugEvent T) {
+	select {
+	case s.read <- debugEvent:
+	case <-s.stop.Done():
+	}
+}
+
+func (s *Subscriber[T]) dispatch(ctx context.Context, vals *queue[DeliveredEvent], acceptCh func() chan DeliveredEvent, snapshot chan chan []DeliveredEvent) bool {
 	t := vals.Peek().Event.(T)
 	for {
 		// Keep the cases in this select in sync with subscribeState.pump
@@ -177,7 +227,7 @@ func (s *Subscriber[T]) dispatch(ctx context.Context, vals *queue[queuedEvent], 
 			vals.Add(val)
 		case <-ctx.Done():
 			return false
-		case ch := <-s.recv.snapshot:
+		case ch := <-snapshot:
 			ch <- vals.Snapshot()
 		}
 	}
@@ -200,5 +250,5 @@ func (s *Subscriber[T]) Done() <-chan struct{} {
 // [Subscriber.Events] block for ever.
 func (s *Subscriber[T]) Close() {
 	s.stop.Stop() // unblock receivers
-	s.recv.deleteSubscriber(reflect.TypeFor[T]())
+	s.unregister()
 }
